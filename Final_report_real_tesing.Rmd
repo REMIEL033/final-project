@@ -1,0 +1,526 @@
+---
+title: "Report for Real Test Data"
+author: "1155107935 SHI, Yifan / 1155183606 WANG, Yanqi / 1155186995 LI, Ruifeng"
+date: '2023-05-19'
+output: html_document
+---
+# Clarification
+
+Our basic logic is to split the data into 3 parts, that are training set, validation set and real test set. At the first stage, validation set is used as test set to show the out-of-sample performance when we do not have real test set. 
+At the second stage, we will use the full sample (combination of training set and validation) to train model to predict CPI and PPI after month 168.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load data into R
+
+Load both training data and out-of-sample test data into R.
+
+```{r}
+load(url("https://github.com/zhentaoshi/Econ5821/raw/main/data_example/dataset_inf.Rdata"))
+load(url("https://github.com/zhentaoshi/Econ5821/raw/main/data_example/data_oos.Rdata"))
+```
+
+# Built-in Evaluation Function
+
+Our forecast performance is measured by the out-of-sample R-squared and Mean Square Error.
+
+```{r}
+oos_rsq <- function(y_true, y_pred) {
+  numerator <- var(y_true - y_pred)
+  denominator <- var(y_true)
+  oos_r_squared <- 1 - (numerator / denominator)
+  return(oos_r_squared)
+}
+
+oos_mse <- function(y_true, y_pred){
+  mse <- mean((y_true-y_pred)^2)
+  return(mse)
+}
+```
+
+# Data Preparation
+
+Since this is a time-series data, we first add some lags into X to become our predictors. To eliminate the scale difference between predictors and outcomes, we normalized the predictors by min-max normalization.
+
+```{r}
+# Convert X to a data frame
+X_df <- as.data.frame(X)
+
+# Function to create lagged variables
+lag_columns <- function(data, lags) {
+  data_lagged <- data
+  for (i in 2:ncol(data)) {
+    for (lag in 1:lags) {
+      lagged_colname <- paste(colnames(data)[i], paste0("lag", lag), sep = "_")
+      data_lagged[, lagged_colname] <- c(rep(NA, lag), data[-((nrow(data) - lag + 1):nrow(data)), i])
+    }
+  }
+  return(data_lagged)
+}
+
+# Create lagged variables for X_df
+lags <- 3 # Change this to the desired number of lags
+X_df_lagged <- lag_columns(X_df, lags)
+
+# Remove variables at time t (non-lagged variables)
+X_df_lagged_only <- subset(X_df_lagged, select = -(2:ncol(X_df)))
+# Remove rows with missing values
+X_df_lagged_clean <- na.omit(X_df_lagged_only)
+
+# Function to normalize columns using min-max normalization
+min_max_normalize_columns <- function(data) {
+  for (i in 2:ncol(data)) {
+    min_value <- min(data[, i], na.rm = TRUE)
+    max_value <- max(data[, i], na.rm = TRUE)
+    data[, i] <- (data[, i] - min_value) / (max_value - min_value)
+  }
+  return(data)
+}
+
+# Apply min-max normalization to X_df_lagged_clean
+X_df_lagged_normalized <- min_max_normalize_columns(X_df_lagged_clean)
+
+```
+
+To unify the numbers of predictors and lags of real.X and training.X. We also add lags predictors for real.X. Here, we cannot directly use lagged function because NA generated cause 3 obs in real.X set. We add month 166 to month 168 data to real.X to generate lags and omit them in the final test set.
+
+```{r}
+
+realX_df <- as.data.frame(real.X)
+realX_with_last3 <- rbind(X_df[166:168,],realX_df)
+
+realX_lagged <- lag_columns(realX_with_last3, lags)
+
+# Remove variables at time t (non-lagged variables)
+realX_df_lagged_only <- subset(realX_lagged, select = -(2:ncol(realX_df)))
+
+# Remove rows with missing values
+realX_df_lagged_clean <- na.omit(realX_df_lagged_only)
+
+#Normalized test X
+realX_df_lagged_normalized <- min_max_normalize_columns(realX_df_lagged_clean)
+```
+
+In most models, multiple variable should convert into matrix type, so we transfer dataset type both for predictors and outcomes.
+
+```{r}
+
+#Full sample training set
+X_mat <- as.matrix(X_df_lagged_clean) #remove the first col "month" to avoid misunderstanding
+X_train <- X_mat[,-1]
+
+X_mat_norm <- as.matrix(X_df_lagged_normalized)
+X_train_norm <- X_mat_norm[,-1]
+
+cpi_train <- cpi$CPI[-(1:lags)]  # remove the first 'lags' observations to align with X_df_lagged_clean
+ppi_train <- ppi$PPI[-(1:lags)]
+
+#Real test set
+realX.test <- as.matrix(realX_df_lagged_clean[,-1])
+realX.test.norm <- as.matrix(realX_df_lagged_normalized[,-1])
+real.cpi.test <- real.cpi$CPI
+real.ppi.test <- real.ppi$PPI
+
+```
+
+
+# Linear model 1: Elastic Net 
+ 
+## with K-fold Cross Validation
+CPI:
+```{r}
+if (!requireNamespace("glmnet", quietly = TRUE)) install.packages("glmnet")
+library(glmnet)
+set.seed(11)
+a=seq(0.01,0.99,0.01)
+
+#CPI
+elnet.cv_cpi<-c()
+for (i in a) {
+  set.seed(123)
+  cv.out<-cv.glmnet(X_train,cpi_train,alpha=i)
+  elnet.cv_cpi<-rbind(elnet.cv_cpi,data.frame(cvm = cv.out$cvm[cv.out$lambda == cv.out$lambda.min], 
+                                              lambda.min = cv.out$lambda.min, alpha = i))
+}
+
+plot(1:nrow(elnet.cv_cpi),elnet.cv_cpi[,1],xlab="alpha and corresponding best lambda for cpi",ylab="cv mean square error",type="b")
+cpi_optcv <- which.min(elnet.cv_cpi$cvm)  #find the optimal alpha and lambda
+points(cpi_optcv,elnet.cv_cpi[cpi_optcv,1], col="red",cex=2,pch=20)
+
+elnet.cpi<-glmnet(X_train,cpi_train,alpha=elnet.cv_cpi[cpi_optcv,3],lambda=elnet.cv_cpi[cpi_optcv,2])
+```
+
+PPI
+```{r}
+elnet.cv_ppi<-c()
+for (i in a) {
+  set.seed(1234)
+  cv.out<-cv.glmnet(X_train,ppi_train,alpha=i)
+  elnet.cv_ppi<-rbind(elnet.cv_ppi,data.frame(cvm = cv.out$cvm[cv.out$lambda == cv.out$lambda.min], 
+                                              lambda.min = cv.out$lambda.min, alpha = i))
+}
+
+plot(1:nrow(elnet.cv_ppi),elnet.cv_ppi[,1],xlab="alpha and corresponding best lambda for ppi",ylab="cv mean square error",type="b")
+ppi_optcv <- which.min(elnet.cv_ppi$cvm)  #find the optimal alpha and lambda
+points(ppi_optcv,elnet.cv_ppi[ppi_optcv,1], col="red",cex=2,pch=20)
+
+elnet.ppi<-glmnet(X_train,ppi_train,alpha=elnet.cv_ppi[ppi_optcv,3],lambda=elnet.cv_ppi[ppi_optcv,2])
+```
+
+Elastic net with k-fold CV results:
+```{r}
+
+mse_cpi_kfoldelnet <- oos_mse(real.cpi.test,predict(elnet.cpi,newx=realX.test))
+rsq_cpi_kfoldelnet <- oos_rsq(real.cpi.test,predict(elnet.cpi,newx=realX.test))
+
+mse_ppi_kfoldelnet <- oos_mse(real.ppi.test,predict(elnet.ppi,newx=realX.test))
+rsq_ppi_kfoldelnet <- oos_rsq(real.ppi.test,predict(elnet.ppi,newx=realX.test))
+
+cat("Mean Squared Error and R^2 for CPI K-fold Elastic Net model:", mse_cpi_kfoldelnet, "and ", rsq_cpi_kfoldelnet,"\n")
+cat("Mean Squared Error and R^2 for PPI K-fold Elastic Net model :", mse_ppi_kfoldelnet, "and ", rsq_ppi_kfoldelnet, "\n")
+```
+
+
+## with Nested Cross Validation
+Normal CV may encounter problem that using future to predict past, so we modify K-fold CV to nested CV.
+
+Basic functions setting:
+```{r}
+library(dplyr)
+
+compute_error <- function(x_train,y_train,x_test,y_test,alpha, lambda) {
+  model <- glmnet(x_train, y_train, alpha = alpha, lambda = lambda)
+  predicted_values <- predict(model, x_test)
+  return(mean((y_test - predicted_values)^2))  
+}
+
+nested_cv <- function(x, y, k = 10) {
+  n <- nrow(x)
+  alpha_seq <- seq(0.01, 0.99, 0.01)
+  cv_results <- data.frame()
+  
+  for (i in 1:k) {
+    train_size <- floor(i * n / k)
+    test_size <- floor(n / k)
+    x_train <- as.matrix(x[1:(train_size), ])
+    y_train <- unlist(y[1:(train_size)])
+    x_test <- as.matrix(x[(train_size + 1):(train_size + test_size), ])
+    y_test <- unlist(y[(train_size + 1):(train_size + test_size)])
+    
+    cv_errors <- numeric(length(alpha_seq))
+    lambda.min <- numeric(length(alpha_seq))
+    for (j in seq_along(alpha_seq)) {
+      alpha <- alpha_seq[j]
+      cv.out <- cv.glmnet(x_train, y_train, alpha = alpha)
+      lambda.min[j] <- cv.out$lambda.min
+      cv_errors[j] <- compute_error(x_train,y_train,x_test,y_test, alpha, lambda.min)
+    }
+    
+    cv_results <- rbind(cv_results, data.frame(alpha = alpha_seq, cv_error = cv_errors, lambda.min=lambda.min))
+  }
+  
+  return(cv_results)
+}
+```
+
+CPI&PPI:
+```{r}
+#cpi
+cpi_nest_results <- nested_cv(X_df_lagged_clean[,-1], cpi_train)
+
+# Find the optimal alpha and corresponding lambda
+cv_means_cpi <- aggregate(cv_error ~ alpha, cpi_nest_results, FUN = mean)
+best_alpha_cpi <- cv_means_cpi$alpha[which.min(cv_means_cpi$cv_error)]
+best_cv_cpi <- subset(cpi_nest_results, alpha == best_alpha_cpi)
+best_lambda_cpi <- best_cv_cpi$lambda.min[which.min(best_cv_cpi$cv_error)]
+
+#Train model
+fit.cpi.nest <-glmnet(X_train, cpi_train, alpha=best_alpha_cpi,lambda=best_lambda_cpi)
+
+
+#ppi
+ppi_nest_results <- nested_cv(X_df_lagged_clean[,-1], ppi_train)
+
+# Find the optimal alpha and corresponding lambda 
+cv_means_ppi <- aggregate(cv_error ~ alpha, ppi_nest_results, FUN = mean)
+best_alpha_ppi <- cv_means_ppi$alpha[which.min(cv_means_ppi$cv_error)]
+best_cv_ppi <- subset(ppi_nest_results, alpha == best_alpha_ppi)
+best_lambda_ppi <- best_cv_ppi$lambda.min[which.min(best_cv_ppi$cv_error)]
+
+#Train model
+fit.ppi.nest <-glmnet(X_train, ppi_train, alpha=best_alpha_ppi,lambda=best_lambda_ppi)
+```
+
+Elastic net with nested CV results:
+```{r}
+mse_cpi_nestelnet <- oos_mse(real.cpi.test,predict(fit.cpi.nest,newx=realX.test))
+rsq_cpi_nestelnet <- oos_rsq(real.cpi.test,predict(fit.cpi.nest,newx=realX.test))
+
+mse_ppi_nestelnet <- oos_mse(real.ppi.test,predict(fit.ppi.nest,newx=realX.test))
+rsq_ppi_nestelnet <- oos_rsq(real.ppi.test,predict(fit.ppi.nest,newx=realX.test))
+
+cat("Mean Squared Error and R^2 for CPI Elastic net(Nested CV) model:", mse_cpi_nestelnet, "and ", rsq_cpi_nestelnet,"\n")
+cat("Mean Squared Error and R^2 for PPI Elastic net(Nested CV) model:", mse_ppi_nestelnet, "and ", rsq_ppi_nestelnet, "\n")
+```
+
+
+# Feature Selection
+
+step1: Pre-selection of variables using ols model
+step2: Choose the most relevant variables using LASSO and Random Forest approaches
+
+```{r}
+# first step, Pre-selection of variables using ols model
+selected_vars_cpi <- c()
+for (i in 1:ncol(X_train_norm)) {
+  ols_model_cpi <- lm(cpi_train ~ X_train_norm[, i])
+  p_value_cpi <- summary(ols_model_cpi)$coefficients[2, 4]
+  
+  if (p_value_cpi < 0.05) {
+    selected_vars_cpi <- c(selected_vars_cpi, colnames(X_train_norm)[i])
+  }
+}
+
+selected_vars_ppi <- c()
+for (i in 1:ncol(X_train_norm)) {
+  ols_model_ppi <- lm(ppi_train ~ X_train_norm[, i])
+  p_value_ppi <- summary(ols_model_ppi)$coefficients[2, 4]
+  
+  if (p_value_ppi < 0.05) {
+    selected_vars_ppi <- c(selected_vars_ppi, colnames(X_train_norm)[i])
+  }
+}
+
+# second step, where we choose the most relevant variables using LASSO and Random Forest approaches:
+# Install and load the required packages
+if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+library(glmnet)
+library(randomForest)
+
+# Function to extract top variable names based on their importance
+top_variables <- function(importance, n_top) {
+  sorted_importance <- importance[order(importance, decreasing = TRUE)]
+  names(sorted_importance)[1:n_top]
+}
+```
+
+## LASSO
+```{r}
+# LASSO for CPI
+X_train_selected_cpi <- X_train_norm[, selected_vars_cpi]
+X_test_selected_cpi <- realX.test.norm[, selected_vars_cpi]
+
+lasso_model_cpi <- glmnet(X_train_selected_cpi, cpi_train, alpha = 1)
+best_lambda_cpi <- lasso_model_cpi$lambda.min
+lasso_coefs_sparse_cpi <- predict(lasso_model_cpi, type = "coefficients", s = best_lambda_cpi)[-1, , drop = FALSE]
+
+# Convert the sparse matrix to a dense matrix
+lasso_coefs_dense_cpi <- as.matrix(lasso_coefs_sparse_cpi)
+
+# Extract the top variables
+lasso_top_vars_cpi <- top_variables(lasso_coefs_dense_cpi[, 1], 15)  # Make sure to select the first column from lasso_coefs_dense
+print(lasso_top_vars_cpi)
+
+# LASSO for PPI
+X_train_selected_ppi <- X_train_norm[, selected_vars_ppi]
+X_test_selected_ppi <- realX.test.norm[, selected_vars_ppi]
+
+lasso_model_ppi <- glmnet(X_train_selected_ppi, ppi_train, alpha = 1,)
+best_lambda_ppi <- lasso_model_ppi$lambda.min
+lasso_coefs_sparse_ppi <- predict(lasso_model_ppi, type = "coefficients", s = best_lambda_ppi)[-1, , drop = FALSE]
+
+# Convert the sparse matrix to a dense matrix
+lasso_coefs_dense_ppi <- as.matrix(lasso_coefs_sparse_ppi)
+
+# Extract the top variables
+lasso_top_vars_ppi <- top_variables(lasso_coefs_dense_ppi[, 1], 10)  # Make sure to select the first column from lasso_coefs_dense
+print(lasso_top_vars_ppi)
+```
+
+## Random Forest 
+```{r}
+# Random Forest for CPI
+rf_model_cpi <- randomForest(X_train_selected_cpi, cpi_train, importance = TRUE)
+rf_importance_cpi <- rf_model_cpi$importance[, "IncNodePurity"]  # Retrieve IncNodePurity as the importance values
+
+rf_top_vars_cpi <- top_variables(rf_importance_cpi, 15)
+print(rf_top_vars_cpi)
+
+# Combine the top variables from LASSO and Random Forest
+top_vars_comb_cpi <- unique(c(lasso_top_vars_cpi, rf_top_vars_cpi))
+
+# Random Forest for PPI
+rf_model_ppi <- randomForest(X_train_selected_ppi, ppi_train, importance = TRUE)
+rf_importance_ppi <- rf_model_ppi$importance[, "IncNodePurity"]  # Retrieve IncNodePurity as the importance values
+
+rf_top_vars_ppi <- top_variables(rf_importance_ppi, 10)
+print(rf_top_vars_ppi)
+
+# Combine the top variables from LASSO and Random Forest
+top_vars_comb_ppi <- unique(c(lasso_top_vars_ppi, rf_top_vars_ppi))
+
+# Prepare the selected data
+X_train_final_cpi <- X_train_norm[, top_vars_comb_cpi]
+X_train_final_ppi <- X_train_norm[, top_vars_comb_ppi]
+
+X_test_final_cpi <- realX.test.norm[, top_vars_comb_cpi]
+X_test_final_ppi <- realX.test.norm[, top_vars_comb_ppi]
+
+```
+
+# Tree model 1: Random Forest
+
+Basic settings: trainControl object, time_series_cv, is created to specify the cross-validation settings for the model training process.
+```{r}
+# Load required libraries
+if (!requireNamespace("forecast", quietly = TRUE)) install.packages("forecast")
+if (!requireNamespace("randomForest", quietly = TRUE)) install.packages("randomForest")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+
+
+library(caret)
+library(forecast)
+library(randomForest)
+
+# Time series cross-validation with a growing window
+time_series_slices <- createTimeSlices(1:length(cpi_train),
+                                       initialWindow = floor(length(cpi_train) / 2),
+                                       horizon = 1,
+                                       fixedWindow = FALSE)
+
+time_series_cv <- trainControl(method = "timeslice",
+                               index = time_series_slices$train,
+                               indexOut = time_series_slices$test)
+```
+
+## Part 1: Random Forest model after Feature Selection
+training and tuning a Random Forest model with different mtry values using time series cross-validation
+
+```{r}
+rf_tune_grid <- expand.grid(mtry = c(1, 2, 3, 4, 5))
+
+# Tuning RF model for CPI
+rf_tuned_cpi <- train(cpi_train ~ ., data = data.frame(cpi_train, X_train_final_cpi),
+                      method = "rf",
+                      trControl = time_series_cv,
+                      tuneGrid = rf_tune_grid)
+
+# Tuning RF model for PPI
+rf_tuned_ppi <- train(ppi_train ~ ., data = data.frame(ppi_train, X_train_final_ppi),
+                      method = "rf",
+                      trControl = time_series_cv,
+                      tuneGrid = rf_tune_grid)
+```
+
+## results
+```{r}
+# Fit the best RF models, make predictions, and calculate OOS MSE and R-squared
+best_rf_cpi <- rf_tuned_cpi$finalModel
+cpi_rf_pred <- predict(best_rf_cpi, X_test_final_cpi)
+mse_cpi_rf <- oos_mse(real.cpi.test, cpi_rf_pred)
+rsq_cpi_rf <- oos_rsq(real.cpi.test, cpi_rf_pred)
+
+best_rf_ppi <- rf_tuned_ppi$finalModel
+ppi_rf_pred <- predict(best_rf_ppi, X_test_final_ppi)
+mse_ppi_rf <- oos_mse(real.ppi.test, ppi_rf_pred)
+rsq_ppi_rf <- oos_rsq(real.ppi.test, ppi_rf_pred)
+
+cat("CPI Random Forest MSE:", mse_cpi_rf, "R-squared:", rsq_cpi_rf, "\n")
+cat("PPI Random Forest MSE:", mse_ppi_rf, "R-squared:", rsq_ppi_rf, "\n")
+```
+
+# Tree model 2: XGBoosting
+Extreme Gradient Boosting (XGBoost) is an open-source library that provides an efficient and effective implementation of the gradient boosting algorithm. It implements gradient boosting with a regularization parameter and parallel processing. XGBoost is one of the well-known techniques having enhanced performance and speed in tree-based statistical learning algorithms. Here we try to use XGBoost to build a model fitting our data and calculate the test r-squared
+
+```{r}
+if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
+library(tidyverse)
+library(caret)
+library(xgboost)
+
+# Parameter tuning
+tuneGrid <- expand.grid(nrounds = c(50, 100, 150),
+                        max_depth = c(3, 5, 7),
+                        eta = c(0.01, 0.1, 0.3),
+                        gamma = c(0, 1, 3),
+                        colsample_bytree = c(0.6, 0.8, 1),
+                        min_child_weight = c(1, 3, 5),
+                        subsample = c(0.6, 0.8, 1))
+
+xgbControl <- trainControl(method = "cv", number = 10)
+
+xgb_cpi_tuned <- train(x = X_train_final_cpi, y = cpi_train,
+                       method = "xgbTree",
+                       trControl = xgbControl,
+                       tuneGrid = tuneGrid)
+
+xgb_ppi_tuned <- train(x = X_train_final_ppi, y = ppi_train,
+                       method = "xgbTree",
+                       trControl = xgbControl,
+                       tuneGrid = tuneGrid)
+
+# Train the final models with the best parameters
+xgb_cpi_final <- xgboost(data = as.matrix(X_train_final_cpi), label = cpi_train,
+                         nrounds = xgb_cpi_tuned$bestTune$nrounds,
+                         max_depth = xgb_cpi_tuned$bestTune$max_depth,
+                         eta = xgb_cpi_tuned$bestTune$eta,
+                         gamma = xgb_cpi_tuned$bestTune$gamma,
+                         colsample_bytree = xgb_cpi_tuned$bestTune$colsample_bytree,
+                         min_child_weight = xgb_cpi_tuned$bestTune$min_child_weight,
+                         subsample = xgb_cpi_tuned$bestTune$subsample)
+
+xgb_ppi_final <- xgboost(data = as.matrix(X_train_final_ppi), label = ppi_train,
+                         nrounds = xgb_ppi_tuned$bestTune$nrounds,
+                         max_depth = xgb_ppi_tuned$bestTune$max_depth,
+                         eta = xgb_ppi_tuned$bestTune$eta,
+                         gamma = xgb_ppi_tuned$bestTune$gamma,
+                         colsample_bytree = xgb_ppi_tuned$bestTune$colsample_bytree,
+                         min_child_weight = xgb_ppi_tuned$bestTune$min_child_weight,
+                         subsample = xgb_ppi_tuned$bestTune$subsample)
+```
+
+## results: Evaluate the final models on test set
+```{r}
+xgb_cpi_preds <- predict(xgb_cpi_final, as.matrix(X_test_final_cpi))
+xgb_ppi_preds <- predict(xgb_ppi_final, as.matrix(X_test_final_ppi))
+
+##### Calculate out-of-sample R-squared####
+
+rsq_cpi_xgb <- oos_rsq(real.cpi.test,xgb_cpi_preds)
+mse_cpi_xgb <- oos_mse(real.cpi.test,xgb_cpi_preds)
+
+rsq_ppi_xgb <- oos_rsq(real.ppi.test,xgb_ppi_preds)
+mse_ppi_xgb <- oos_mse(real.ppi.test,xgb_ppi_preds)
+```
+
+# Summary of the best model for CPI and PPI
+
+```{r}
+Out_of_sample_cpi <- list()
+Out_of_sample_cpi[["Elastic Net (k-fold)"]] <- list(oos_mse = mse_cpi_kfoldelnet, oos_rsq = rsq_cpi_kfoldelnet)
+Out_of_sample_cpi[["Elastic Net (Nested)"]] <- list(oos_mse = mse_cpi_nestelnet, oos_rsq = rsq_cpi_nestelnet)
+
+Out_of_sample_cpi[["Random Forest"]] <- list(oos_mse = mse_cpi_rf, oos_rsq = rsq_cpi_rf)
+Out_of_sample_cpi[["XGBoosting"]] <- list(oos_mse = mse_cpi_xgb, oos_rsq = rsq_cpi_xgb)
+```
+
+
+```{r}
+Out_of_sample_ppi <- list()
+Out_of_sample_cpi[["Elastic Net (k-fold)"]] <- list(oos_mse = mse_ppi_kfoldelnet, oos_rsq = rsq_ppi_kfoldelnet)
+Out_of_sample_ppi[["Elastic Net (Nested)"]] <- list(oos_mse = mse_ppi_nestelnet, oos_rsq = rsq_ppi_nestelnet)
+
+Out_of_sample_ppi[["Random Forest"]] <- list(oos_mse = mse_ppi_rf, oos_rsq  = rsq_ppi_rf)
+Out_of_sample_ppi[["XGBoosting"]] <- list(oos_mse = mse_ppi_xgb, oos_rsq = rsq_ppi_xgb)
+```
+
+
+```{r}
+print(Out_of_sample_cpi)
+print(Out_of_sample_ppi)
+
+```
+
+Based on previous outcome from 80% training set and 20% validation set, elastic net shows the best prediction power for both CPI and PPI. Training model with full sample  to predict CPI and PPI after month 169, elastic net also gives the best prediction. The prediction evaluation will be printed out as our "Out_of_sample_cpi" and "Out_of_sample_ppi".
